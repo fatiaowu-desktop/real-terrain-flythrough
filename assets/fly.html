@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  真实地形三维穿越场景模板 —— 由 world.json 驱动,换地点只需重跑 build_world.py
+  ============================================================================
+  部署:本文件放在 <项目>/web/fly.html,three.js 放 <项目>/vendor/three.module.js,
+        资源放 <项目>/web/ 下。用任意静态服务器在项目根目录起服务后访问 /web/fly.html。
+        渲染驱动通过 window.renderFrame(t) 逐帧推进 (t: 0..1),并设置 window.__ready = true。
+
+  ---- 可调旋钮(改完务必用 scripts/measure.py 复核数值,别靠肉眼) ----
+  光照/曝光
+    ALBEDO_GAIN (0.72)   压反照率。卫星影像里雪的反照率接近 255,不压会乘太阳光后裁成死白
+    gExposure   (1.38)   总曝光
+    sunAz/sunAlt         读自 world.json,改它要同步重跑 build_world.py 重烘阴影
+  大气透视(决定远山是"有层次"还是"糊成灰片")
+    fogNear size*0.42 / fogFar size*1.35,混合量见 shader 里的 f * 0.50
+    haze = mix(fogCol, skyCol, 0.35)   —— 雾里掺天空色才能保住灰阶层次
+  云系三层
+    CLOUD_Y      0.90*(maxH-minH)  成簇积云带,接近峰顶
+    CLOUD_SEA_Y  0.16*(maxH-minH)  低位云海,峰尖从云里戳出
+    积云尺度 sc = size*(0.05~0.19)  → 约 1.2~4.6km,**真实积云就这个量级**
+    积云环带 cr = (0.35~1.1)*size   → 必须在相机环绕轨道(0.58~1.05*R)之外,
+                                      否则相机怼在巨型白云前,整片天空被糊白
+    太阳辉光 sun.scale = size*0.80  → 加性混合,过大会把整片天空洗白(亮度>0.75 即越界)
+  相机
+    theta -78°→26°,radius 1.05R→0.58R,高度 1450→90m,CLEAR=780m(离地安全高度)
+
+  ---- 判据(健康区间,用 measure.py 量) ----
+    天空区(上35%) 饱和度 0.30~0.45,亮度 0.50~0.65,蓝>红
+    天空云像素占比 10%~30%
+  ============================================================================
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>terrain flight</title>
+<style>
+  html,body{margin:0;background:#0b0e12;overflow:hidden}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const W = 1280, H = 720;
+const CLEAR = 780;
+const ALBEDO_GAIN = 0.72;      // 压反照率,给高光留回旋空间
+
+let world, heights, N, km, minH, maxH;
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im); im.onerror = rej; im.src = src;
+  });
+}
+
+async function boot() {
+  world = await (await fetch('/web/world.json')).json();
+  N = world.grid; km = world.km; minH = world.minH; maxH = world.maxH;
+
+  const hImg = await loadImage('/web/heights.png');
+  const hc = document.createElement('canvas'); hc.width = hImg.width; hc.height = hImg.height;
+  const hctx = hc.getContext('2d', { willReadFrequently: true });
+  hctx.drawImage(hImg, 0, 0);
+  const hd = hctx.getImageData(0, 0, hImg.width, hImg.height).data;
+  heights = new Float32Array(N * N);
+  for (let i = 0; i < N * N; i++) {
+    const v = hd[i * 4] * 256 + hd[i * 4 + 1];
+    heights[i] = minH + (v / 65535) * (maxH - minH);
+  }
+
+  const satImg = await loadImage('/web/satellite.jpg');
+  const tex = new THREE.Texture(satImg);
+  tex.anisotropy = 8;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+
+  const shImg = await loadImage('/web/shadow.png');
+  const shTex = new THREE.Texture(shImg);
+  shTex.minFilter = THREE.LinearFilter;
+  shTex.magFilter = THREE.LinearFilter;
+  shTex.generateMipmaps = false;
+  shTex.needsUpdate = true;
+
+  const nmImg = await loadImage('/web/normal.png');
+  const nmTex = new THREE.Texture(nmImg);
+  nmTex.minFilter = THREE.LinearMipmapLinearFilter;
+  nmTex.magFilter = THREE.LinearFilter;
+  nmTex.anisotropy = 8;
+  nmTex.needsUpdate = true;
+
+  const clImg = await loadImage('/web/cloud.png');
+  const clTex = new THREE.Texture(clImg);
+  clTex.wrapS = clTex.wrapT = THREE.RepeatWrapping;
+  clTex.minFilter = THREE.LinearMipmapLinearFilter;
+  clTex.magFilter = THREE.LinearFilter;
+  clTex.anisotropy = 4;
+  clTex.needsUpdate = true;
+
+  // 积云贴图(带受光/背阴渐变),用作公告板精灵 —— 关掉 sRGB 解码,保持贴图里的显示值
+  const cuImg = await loadImage('/web/cumulus.png');
+  const cuTex = new THREE.Texture(cuImg);
+  cuTex.colorSpace = THREE.LinearSRGBColorSpace;
+  cuTex.minFilter = THREE.LinearMipmapLinearFilter;
+  cuTex.magFilter = THREE.LinearFilter;
+  cuTex.generateMipmaps = true;
+  cuTex.needsUpdate = true;
+
+  // 天空穹顶贴图(竖直渐变 + 高空柔云)
+  const skyImg = await loadImage('/web/sky.png');
+  const skyTex = new THREE.Texture(skyImg);
+  skyTex.colorSpace = THREE.LinearSRGBColorSpace;
+  skyTex.minFilter = THREE.LinearMipmapLinearFilter;
+  skyTex.magFilter = THREE.LinearFilter;
+  skyTex.needsUpdate = true;
+
+  const size = km * 1000;
+  const R = size / 2;
+  const geo = new THREE.PlaneGeometry(size, size, N - 1, N - 1);
+  geo.rotateX(-Math.PI / 2);
+
+  const pos = geo.attributes.position;
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < pos.count; i++) {
+    const col = i % N, row = Math.floor(i / N);
+    pos.setY(i, heights[row * N + col] - minH);
+    uv.setXY(i, col / (N - 1), 1 - row / (N - 1));
+  }
+  pos.needsUpdate = true; uv.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x9fb8cf);
+
+  const az = THREE.MathUtils.degToRad(world.sunAz);
+  const al = THREE.MathUtils.degToRad(world.sunAlt);
+  const sunDir = new THREE.Vector3(Math.cos(al) * Math.sin(az), Math.sin(al),
+                                   -Math.cos(al) * Math.cos(az)).normalize();
+
+  const CLOUD_Y = 0.90 * (maxH - minH);     // 成簇积云带:接近峰顶,不被山体完全遮挡
+  const CLOUD_SEA_Y = 0.16 * (maxH - minH); // 低位云海:贴山基,峰尖从云里戳出
+
+  // ---------- 天空穹顶 ----------
+  const skyGeo = new THREE.SphereGeometry(size * 9, 48, 24);
+  const skyMat = new THREE.ShaderMaterial({
+    uniforms: { skyTex: { value: skyTex } },
+    side: THREE.BackSide, depthWrite: false,
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `uniform sampler2D skyTex; varying vec2 vUv;
+      void main(){ vec3 c = texture2D(skyTex, vUv).rgb; gl_FragColor = vec4(c,1.0); }`,
+  });
+  const skyMesh = new THREE.Mesh(skyGeo, skyMat);
+  skyMesh.renderOrder = -10;
+  scene.add(skyMesh);
+
+  // ---------- 太阳辉光(加性精灵,保证与地形光照同侧) ----------
+  function makeGlow() {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+    grd.addColorStop(0.00, 'rgba(255,252,240,0.85)');
+    grd.addColorStop(0.10, 'rgba(255,246,214,0.55)');
+    grd.addColorStop(0.32, 'rgba(255,232,176,0.18)');
+    grd.addColorStop(1.00, 'rgba(255,220,150,0.0)');
+    g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
+    return new THREE.CanvasTexture(c);
+  }
+  const glowTex = makeGlow();
+  const sunMat = new THREE.SpriteMaterial({
+    map: glowTex, transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending, fog: false,
+  });
+  const sun = new THREE.Sprite(sunMat);
+  sun.position.copy(sunDir).multiplyScalar(size * 6);
+  sun.scale.set(size * 0.80, size * 0.80, 1);   // 适中:有日晕但不洗白整片天空
+  sun.renderOrder = -5;
+  scene.add(sun);
+
+  // ---------- 地形 ----------
+  const uniforms = {
+    map:       { value: tex },
+    shadowMap: { value: shTex },
+    normalMap: { value: nmTex },
+    cloudTex:  { value: clTex },
+    sunDir:    { value: sunDir },
+    sunColor:  { value: new THREE.Vector3(1.00, 0.96, 0.90) },
+    skyCol:    { value: new THREE.Vector3(0.52, 0.51, 0.54) },
+    groundCol: { value: new THREE.Vector3(0.28, 0.27, 0.265) },
+    fogCol:    { value: new THREE.Vector3(0.76, 0.80, 0.83) },
+    fogNear:   { value: size * 0.42 },
+    fogFar:    { value: size * 1.35 },
+    gAlbedo:   { value: ALBEDO_GAIN },
+    gExposure: { value: 1.38 },
+    cloudY:    { value: CLOUD_Y },
+    cloudPlane:{ value: size * 5.0 },
+    cloudRepeat:{ value: 4.5 },
+  };
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec3 vN;
+      varying vec3 vWorld;
+      varying float vDist;
+      void main(){
+        vUv = uv;
+        vN  = normalize(normal);
+        vWorld = position;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vDist = -mv.z;
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform sampler2D map;
+      uniform sampler2D shadowMap;
+      uniform sampler2D normalMap;
+      uniform sampler2D cloudTex;
+      uniform vec3 sunDir, sunColor, skyCol, groundCol, fogCol;
+      uniform float fogNear, fogFar, gAlbedo, gExposure;
+      uniform float cloudY, cloudPlane, cloudRepeat;
+      varying vec2 vUv;
+      varying vec3 vN;
+      varying vec3 vWorld;
+      varying float vDist;
+
+      void main(){
+        vec3 base = texture2D(map, vUv).rgb;
+        base = mix(base, base*base*(3.0 - 2.0*base), 0.45);
+        // ESRI 该区源影像整体绿偏:亮部(雪/冰)把绿压到不超过红蓝最大值,消除青绿;暗部绿保留
+        float luma = dot(base, vec3(0.299, 0.587, 0.114));
+        base = mix(vec3(luma), base, 0.66);
+        float bright = smoothstep(0.38, 0.70, luma);
+        vec3 nbase = vec3(base.r, min(base.g, max(base.r, base.b)), base.b);
+        base = mix(base, nbase, bright);
+
+        vec3 nm = texture2D(normalMap, vUv).rgb * 2.0 - 1.0;
+        vec3 n = normalize(mix(normalize(vN), normalize(nm), 0.34));
+
+        float ndl = max(dot(n, sunDir), 0.0);
+        float diff = pow(ndl, 0.72);
+        float sh = texture2D(shadowMap, vUv).r;
+
+        // 云影:把地面点沿太阳方向投到积云带高度取云密度
+        float tUp = max(cloudY - vWorld.y, 0.0) / max(sunDir.y, 0.22);
+        vec2 cp = vWorld.xz + sunDir.xz * tUp;
+        vec2 cuv = (cp / cloudPlane + 0.5) * cloudRepeat;
+        float cs = texture2D(cloudTex, cuv).a;
+        cs = clamp(cs * 1.6, 0.0, 1.0) * 0.62;   // 云影加实,让云和地形产生明暗耦合
+
+        vec3 direct = sunColor * diff * mix(0.17, 1.0, sh) * (1.0 - cs) * 1.35;
+
+        float up = n.y * 0.5 + 0.5;
+        vec3 amb = mix(groundCol, skyCol, up) * (0.34 + 0.24 * sh);
+
+        float steep = 1.0 - smoothstep(0.35, 0.96, n.y);
+        float alb = gAlbedo * mix(1.0, 0.86, steep);
+
+        vec3 col = base * alb * (direct + amb) * gExposure;
+
+        // 保色大气透视:远山透得出纹理而非糊成灰片
+        float f = smoothstep(fogNear, fogFar, vDist);
+        float lum = dot(col, vec3(0.299, 0.587, 0.114));
+        vec3 haze = mix(fogCol, skyCol, 0.35) * (0.52 + 0.62 * lum);
+        col = mix(col, haze, f * 0.50);
+
+        col = col / (1.0 + 0.22 * col);
+        col = pow(clamp(col, 0.0, 1.0), vec3(0.95));
+        gl_FragColor = vec4(col, 1.0);
+      }`,
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  scene.add(mesh);
+
+  // ---------- 低位云海(贴山基的水平云面) ----------
+  function cloudSea(y, opacity) {
+    const cg = new THREE.PlaneGeometry(size * 10, size * 10, 1, 1);
+    cg.rotateX(-Math.PI / 2);
+    const u = {
+      cloudTex: { value: clTex },
+      uRep:     { value: 2.0 },
+      uOffset:  { value: new THREE.Vector2(0, 0) },
+      uOpacity: { value: opacity },
+      uFar:     { value: size * 3.2 },
+      uEdge:    { value: size * 4.0 },
+    };
+    const m = new THREE.ShaderMaterial({
+      uniforms: u,
+      transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      vertexShader: `
+        varying vec2 vUv; varying float vDist; varying vec3 vW;
+        void main(){ vUv = uv; vW = position;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0); vDist = -mv.z;
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: `
+        uniform sampler2D cloudTex; uniform float uRep, uOpacity, uFar, uEdge;
+        uniform vec2 uOffset; varying vec2 vUv; varying float vDist; varying vec3 vW;
+        void main(){
+          vec2 uv = vUv * uRep + uOffset;
+          float a = texture2D(cloudTex, uv).a;
+          float b = texture2D(cloudTex, uv * 2.1 + vec2(0.2, 0.5)).a;
+          // 第三层:不同旋转/尺度的采样,打断平铺造成的重复纸状条纹
+          vec2 rot = vec2(uv.x * 0.86 - uv.y * 0.51, uv.x * 0.51 + uv.y * 0.86);
+          float c2 = texture2D(cloudTex, rot * 0.63 + vec2(0.37, 0.11)).a;
+          a = clamp(a * 0.62 + b * 0.28 + c2 * 0.30, 0.0, 1.0);
+          a = clamp(a * 1.45 - 0.28, 0.0, 1.0) * uOpacity;   // 更密实的云海
+          // 厚处暖白,薄处偏冷蓝(云海自身的体积感)
+          vec3 c = mix(vec3(0.74, 0.79, 0.90), vec3(1.0, 0.99, 0.97), clamp(a*1.2,0.0,1.0));
+          float rad = length(vW.xz) / uEdge;
+          a *= 1.0 - smoothstep(0.55, 1.0, rad);              // 远处淡出,不露硬边
+          float f = smoothstep(2500.0, uFar, vDist);
+          a *= (1.0 - f * 0.55);
+          if (a < 0.004) discard;
+          gl_FragColor = vec4(c, a);
+        }`,
+    });
+    const cm = new THREE.Mesh(cg, m);
+    cm.position.y = y;
+    cm.renderOrder = 1;
+    scene.add(cm);
+    return u;
+  }
+  const seaU = cloudSea(CLOUD_SEA_Y, 0.78);
+
+  // ---------- 成簇积云(峰顶周围扎堆,有体积光照) ----------
+  function buildCumulus() {
+    const list = [];
+    let s = 1234567;
+    const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    // 云场要落在相机环绕轨道之外,否则相机怼在巨型白云前面,整片天空被糊白
+    const clusters = 9;
+    for (let c = 0; c < clusters; c++) {
+      const ca = rnd() * Math.PI * 2;
+      const cr = (0.35 + rnd() * 0.75) * size;               // 半径拉开,避免投影成一条线
+      const cx0 = summit.x + Math.cos(ca) * cr;
+      const cz0 = summit.z + Math.sin(ca) * cr;
+      const nIn = 3 + Math.floor(rnd() * 3);
+      for (let k = 0; k < nIn; k++) {
+        const ang = rnd() * Math.PI * 2, rr = rnd() * size * 0.16;
+        const bx = cx0 + Math.cos(ang) * rr;
+        const bz = cz0 + Math.sin(ang) * rr;
+        let h = CLOUD_Y + (rnd() * 2 - 1) * 1200;            // 高度也拉开
+        if (rnd() < 0.35) h += rnd() * 2200;                 // 垂直发展:抬到相机高度以上,出现在高空
+        const sc = size * (0.05 + rnd() * 0.14);              // 1.2~4.6km 真实积云尺度
+        const op = 0.90 + rnd() * 0.10;
+        const m = new THREE.SpriteMaterial({
+          map: cuTex, transparent: true, depthWrite: false,
+          opacity: op, fog: false,
+        });
+        const sp = new THREE.Sprite(m);
+        sp.position.set(bx, h, bz);
+        sp.scale.set(sc, sc * 0.66, 1);
+        sp.renderOrder = 3;
+        scene.add(sp);
+        list.push({ sp, bx, bz, ph: rnd() * 100, drift: 0.4 + rnd() * 1.0, op });
+      }
+    }
+    return list;
+  }
+
+  // ---------- 高空淡云已由天空穹顶承担,此处不再叠加独立精灵 ----------
+
+  const cam = new THREE.PerspectiveCamera(44, W / H, 40, size * 12);
+  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+  renderer.setSize(W, H);
+  renderer.setPixelRatio(1);
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  document.body.appendChild(renderer.domElement);
+
+  let best = -1, bi = 0;
+  for (let i = 0; i < heights.length; i++) if (heights[i] > best) { best = heights[i]; bi = i; }
+  const col0 = bi % N, row0 = Math.floor(bi / N);
+  const summit = new THREE.Vector3(-R + size * col0 / (N - 1), best - minH,
+                                   -R + size * row0 / (N - 1));
+
+  const cumList = buildCumulus();
+
+  const dir = new THREE.Vector3(0.70, 0, -0.71).normalize();
+  const side = new THREE.Vector3(-dir.z, 0, dir.x);
+
+  function terrainAt(x, z) {
+    const c = Math.round((x + R) / size * (N - 1));
+    const r = Math.round((z + R) / size * (N - 1));
+    const cc = Math.min(N - 1, Math.max(0, c)), rr = Math.min(N - 1, Math.max(0, r));
+    return heights[rr * N + cc] - minH;
+  }
+
+  window.renderFrame = (t) => {
+    const e = t * t * (3 - 2 * t);
+    const theta = THREE.MathUtils.degToRad(THREE.MathUtils.lerp(-78, 26, e));
+    const radius = THREE.MathUtils.lerp(1.05 * R, 0.58 * R, Math.pow(e, 1.15));
+    const px = summit.x + (dir.x * Math.cos(theta) + side.x * Math.sin(theta)) * radius;
+    const pz = summit.z + (dir.z * Math.cos(theta) + side.z * Math.sin(theta)) * radius;
+
+    let py = summit.y + THREE.MathUtils.lerp(1450, 90, Math.pow(e, 0.85));
+    py = Math.max(py, terrainAt(px, pz) + CLEAR);
+
+    cam.position.set(px, py, pz);
+    const target = summit.clone(); target.y -= 120;
+    cam.lookAt(target);
+    cam.rotateZ(Math.sin(t * Math.PI * 1.1) * 0.016);
+
+    // 云海缓慢漂移
+    seaU.uOffset.value.set(t * 0.012, t * 0.004);
+
+    // 积云空气透视:远处的云降对比并融入天色,否则远近一样清晰会读成"贴上去的贴纸"
+    for (const p of cumList) {
+      p.sp.position.x = p.bx + Math.sin(t * 0.18 + p.ph) * size * 0.04 * p.drift;
+      p.sp.position.z = p.bz + Math.cos(t * 0.15 + p.ph) * size * 0.03 * p.drift;
+      const d = cam.position.distanceTo(p.sp.position);
+      const f = THREE.MathUtils.smoothstep(d, size * 0.7, size * 2.6);
+      p.sp.material.opacity = p.op * (1 - 0.62 * f);
+      p.sp.material.color.setRGB(1 - 0.14 * f, 1 - 0.10 * f, 1 - 0.05 * f);
+    }
+
+    renderer.render(scene, cam);
+  };
+
+  window.renderFrame(0);
+  window.__ready = true;
+}
+
+boot();
+</script>
+</body>
+</html>
