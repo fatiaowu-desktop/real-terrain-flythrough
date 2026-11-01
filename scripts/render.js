@@ -32,13 +32,18 @@ const timeout = (ms) => new Promise(r => setTimeout(r, ms));
 
 (async () => {
   fs.mkdirSync(OUTDIR, { recursive: true });
+  // GPU=1 走真 GPU(ANGLE/Metal);默认软件光栅 SwiftShader(任何机器都能跑,但慢 10~30 倍)。
+  // 体积云等重效果只有 GPU 模式才谈得上。
+  const gpuArgs = process.env.GPU === '1'
+    ? ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist',
+       '--enable-zero-copy', '--no-sandbox', '--disable-gpu-sandbox']
+    : ['--enable-unsafe-swiftshader', '--use-gl=angle', '--use-angle=swiftshader',
+       '--no-sandbox', '--disable-gpu-sandbox'];
   const browser = await puppeteer.launch({
     executablePath: CHROME,
     headless: 'new',
     args: [
-      '--enable-unsafe-swiftshader',
-      '--use-gl=angle', '--use-angle=swiftshader',
-      '--no-sandbox', '--disable-gpu-sandbox',
+      ...gpuArgs,
       '--hide-scrollbars', '--mute-audio',
       `--window-size=${W},${H}`,
     ],

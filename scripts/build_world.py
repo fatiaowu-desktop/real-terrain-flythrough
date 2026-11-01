@@ -18,7 +18,7 @@ import os
 import sys
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import clouds as CL  # noqa: E402
@@ -30,12 +30,14 @@ import shade as SH  # noqa: E402
 def build(name="未命名", sub="", latin="", lat=0.0, lon=0.0, km=20.0,
           grid=640, tex=4096, sun_az=318.0, sun_alt=33.0,
           outdir="web", cache_tiles="cache_tiles", cache_imagery="cache_imagery",
-          gen_clouds=True):
+          gen_clouds=True, imagery_source="esri"):
     os.makedirs(outdir, exist_ok=True)
     bbox = dem.bbox_from_center(lat, lon, km, 1.0)
     elev, res, z = dem.build_elevation(bbox, cache=cache_tiles)
-    sat = imagery.build_imagery(bbox, z + 1, cache=cache_imagery,
-                                lonlat_to_px=dem.lonlat_to_px)
+    # S2 原始分辨率 10m,再往上放大只是插值;ESRI 则值得高一档 zoom 拿真实细节
+    img_z = z + 1 if imagery_source == "esri" else z
+    sat = imagery.build_imagery(bbox, img_z, cache=cache_imagery,
+                                lonlat_to_px=dem.lonlat_to_px, source=imagery_source)
     print(f"[world] DEM {elev.shape}  {res:.1f}m/px  影像 {sat.shape}")
 
     # --- 高程按网格重采样,打包成 16bit ---
@@ -91,6 +93,11 @@ def build(name="未命名", sub="", latin="", lat=0.0, lon=0.0, km=20.0,
     if max(im.size) > tex:
         k = tex / max(im.size)
         im = im.resize((int(im.width * k), int(im.height * k)), Image.LANCZOS)
+    if imagery_source == "esri":
+        # ESRI 的瓦片间有纹理断层,边界锐利;轻模糊能把它接到"看不出线",
+        # 而雪纹属高频基本无损(细节另由 normalMap + detail.png 补)。
+        # S2 无此问题,不做处理以保住细节。
+        im = im.filter(ImageFilter.GaussianBlur(2.6))
     im.save(os.path.join(outdir, "satellite.jpg"), quality=90)
 
     meta = dict(name=name, latin=latin or name, sub=sub,
@@ -127,11 +134,13 @@ def main():
     ap.add_argument("--cache-tiles", default="cache_tiles")
     ap.add_argument("--cache-imagery", default="cache_imagery")
     ap.add_argument("--no-clouds", action="store_true", help="跳过云贴图生成")
+    ap.add_argument("--imagery-source", default="esri", choices=["esri", "s2"],
+                    help="esri=细节多但瓦片间有色差方块;s2=Sentinel-2 无云合成,无缝但雪区偏白")
     a = ap.parse_args()
     build(name=a.name, sub=a.sub, latin=a.latin, lat=a.lat, lon=a.lon, km=a.km,
           grid=a.grid, tex=a.tex, sun_az=a.sun_az, sun_alt=a.sun_alt,
           outdir=a.outdir, cache_tiles=a.cache_tiles, cache_imagery=a.cache_imagery,
-          gen_clouds=not a.no_clouds)
+          gen_clouds=not a.no_clouds, imagery_source=a.imagery_source)
 
 
 if __name__ == "__main__":

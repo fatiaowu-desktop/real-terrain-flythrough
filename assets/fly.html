@@ -131,8 +131,11 @@ async function boot() {
   const skyImg = await loadImage('/web/sky.png');
   const skyTex = new THREE.Texture(skyImg);
   skyTex.colorSpace = THREE.LinearSRGBColorSpace;
-  skyTex.minFilter = THREE.LinearMipmapLinearFilter;
+  // 天空球半径 size*9,相机只看球面很小一块 —— 开 mipmap 会选到很高的 mip 级别,
+  // 把云整个抹平(贴图上有 36.8% 云,渲染出来一朵都没有)。这里关掉 mipmap 保住云。
+  skyTex.minFilter = THREE.LinearFilter;
   skyTex.magFilter = THREE.LinearFilter;
+  skyTex.generateMipmaps = false;
   skyTex.needsUpdate = true;
 
   const size = km * 1000;
@@ -403,7 +406,7 @@ async function boot() {
     };
     for (let c = 0; c < clusters; c++) {
       const ca = rnd() * Math.PI * 2;
-      const cr = (0.75 + rnd() * 0.85) * size;              // 全部推到相机轨道(0.29~0.53×size)之外,近处大云最显"贴纸"
+      const cr = (1.10 + rnd() * 0.80) * size;              // 更远:退成背景云层,不让观众看清"纸边"
       const cx0 = summit.x + Math.cos(ca) * cr;
       const cz0 = summit.z + Math.sin(ca) * cr;
       const nIn = 2 + Math.floor(rnd() * 2);
@@ -416,7 +419,7 @@ async function boot() {
         const h = CLOUD_Y * 0.50 + hb * relH * 1.60 + (rnd() * 2 - 1) * 260;
         // 尺度:幂律——大量小云 + 少数大云,方差拉大才能读出不规则
         const sc = size * (0.045 + Math.pow(rnd(), 1.8) * 0.26);   // 方差拉大:大云撑场面,小云点缀
-        const op = 0.55 + rnd() * 0.45;
+        const op = 0.42 + rnd() * 0.26;
         push(bx, bz, h, sc, op, 0.62);
         // 垂直发展:40% 的云加一个顶部隆起,形成塔状而非单个扁球
         if (rnd() < 0.40) {
@@ -443,6 +446,8 @@ async function boot() {
   const summit = new THREE.Vector3(-R + size * col0 / (N - 1), best - minH,
                                    -R + size * row0 / (N - 1));
 
+  // 3D 积云只作**远景云层**:推到 1.1~1.9×size 之外、压低不透明度。
+  // 公告板精灵凑近看一定是纸贴纸,唯一能藏住的方式是让它足够远、足够淡。
   const cumList = buildCumulus();
 
   const dir = new THREE.Vector3(0.70, 0, -0.71).normalize();
