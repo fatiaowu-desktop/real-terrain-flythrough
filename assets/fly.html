@@ -270,7 +270,9 @@ async function boot() {
         base = mix(base, base * vec3(0.93, 0.97, 1.07), snowM);   // 雪偏冷蓝
 
         vec3 nm = texture2D(normalMap, vUv).rgb * 2.0 - 1.0;
-        vec3 n = normalize(mix(normalize(vN), normalize(nm), 0.34));
+        // 法线强度不能高:normalMap 是从 4m 高程算出来的,含 DEM 本身的采样噪声,
+        // 强度 0.34 时近景雪面会显出规则的菱形/星形格子。收到 0.16 只留下真正的坡面起伏。
+        vec3 n = normalize(mix(normalize(vN), normalize(nm), 0.16));
 
         float ndl = max(dot(n, sunDir), 0.0);
         float diff = pow(ndl, 0.72);

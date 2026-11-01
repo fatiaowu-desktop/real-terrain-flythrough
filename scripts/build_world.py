@@ -63,17 +63,27 @@ def build(name="未命名", sub="", latin="", lat=0.0, lon=0.0, km=20.0,
     # ambient_occlusion 原始输出只有 0.55~1.0,压暗太弱(实测画面 std 几乎不变),
     # 这里重映射到 0.48~1.0 再双尺度叠加。高差小/阴影少的地形(如高原面)
     # 全靠 AO 提供体量感,否则整片读成"白石膏"。
-    def _stretch(a):
-        t = np.clip((a - 0.55) / 0.45, 0.0, 1.0)
-        t = t * t * (3 - 2 * t)
-        return 0.48 + 0.52 * t
+    def _ao(g, radius_px):
+        # passes 必须够多:2 次 box_blur 的核仍是方的,近景放大后雪面上会出现
+        # 规则的方形/菱形灰印。多次卷积按中心极限定理趋近高斯,4 次就基本干净。
+        ref = dem.box_blur(g, radius_px, passes=4)
+        d = g - ref
+        lo_, hi_ = np.percentile(d, 2), np.percentile(d, 98)
+        t = np.clip((d - lo_) / max(hi_ - lo_, 1e-6), 0, 1)
+        return t * t * (3 - 2 * t)
 
-    cell = km * 1000.0 / (grid - 1)
-    ao = 0.58 * _stretch(SH.ambient_occlusion(g, cell, radius_px=14)) \
-        + 0.42 * _stretch(SH.ambient_occlusion(g, cell, radius_px=55))
+    # AO 必须在高分辨率上算:在 grid(768) 上算再存成 2048,信息量仍然只有 768,
+    # 近景放大后每个 AO 像素就是一块 (实测在雪面上表现为 15~25m 的方形马赛克)。
+    # 这里直接用原始 elev 重采样到 2048 再算,空间分辨率提高 2.7 倍。
+    AO_N = 2048
+    ao_src = np.asarray(Image.fromarray(elev, mode="F").resize((AO_N, AO_N), Image.LANCZOS),
+                        np.float32)
+    ao_cell = km * 1000.0 / AO_N
+    # 半径按米换算:14px@768 ≈ 218m、55px@768 ≈ 858m,换成 2048 上的像素数
+    ao = 0.48 + 0.52 * (0.58 * _ao(ao_src, max(2, int(round(218.0 / ao_cell))))
+                        + 0.42 * _ao(ao_src, max(3, int(round(858.0 / ao_cell)))))
     ao = np.clip(ao, 0, 1)
-    Image.fromarray((ao * 255).astype(np.uint8)).resize((1024, 1024), Image.LANCZOS) \
-         .save(os.path.join(outdir, "ao.png"))
+    Image.fromarray((ao * 255).astype(np.uint8)).save(os.path.join(outdir, "ao.png"))
     print(f"[ao] 均值 {ao.mean():.2f}  暗部(<0.6) {(ao < 0.6).mean()*100:.1f}%")
 
     # --- 逐像素法线:比顶点法线细一个数量级,是近景细节的关键 ---

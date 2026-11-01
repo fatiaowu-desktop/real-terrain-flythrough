@@ -167,10 +167,11 @@ def build_detail(n=2048, outdir="web"):
     频率必须够高且三档权重接近:低频那档权重过大时,雪面会被拉出方向性条纹,
     读成"水波/绸缎"而不是雪。
     """
-    a = fbm_seamless(n, base=15, octaves=4, persistence=0.55, seed=101)
-    b = fbm_seamless(n, base=44, octaves=4, persistence=0.50, seed=202)
-    c = fbm_seamless(n, base=120, octaves=3, persistence=0.46, seed=303)
+    a = fbm_seamless(n, base=34, octaves=4, persistence=0.55, seed=101)
+    b = fbm_seamless(n, base=95, octaves=4, persistence=0.50, seed=202)
+    c = fbm_seamless(n, base=260, octaves=3, persistence=0.46, seed=303)
     d = a * 0.34 + b * 0.36 + c * 0.30
+    d = _blur(d, 2)                     # 抹掉值噪声格点(base=15 时每 136px 一个,放大就是方块)
     d = (d - d.mean()) / max(float(d.std()), 1e-6) * 0.09 + 0.5
     d = np.clip(d, 0, 1)
     p = os.path.join(outdir, "detail.png")
