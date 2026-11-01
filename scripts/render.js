@@ -45,11 +45,14 @@ const timeout = (ms) => new Promise(r => setTimeout(r, ms));
   });
   const page = await browser.newPage();
   await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+  // 必须禁用缓存:否则重烘的贴图(sky.png 等)会被浏览器旧缓存盖住,
+  // 表现为"参数改了但画面数值逐位相同",极难排查。
+  await page.setCacheEnabled(false);
   page.on('console', m => console.log('[page]', m.text()));
   page.on('pageerror', e => console.error('[pageerror]', e.message));
 
   const t0 = Date.now();
-  await page.goto(`http://127.0.0.1:${PORT}${PAGE}`, { waitUntil: 'load', timeout: 120000 });
+  await page.goto(`http://127.0.0.1:${PORT}${PAGE}?t=${Date.now()}`, { waitUntil: 'load', timeout: 120000 });
   await page.waitForFunction('window.__ready === true', { timeout: 180000 });
   console.log(`[init] ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 

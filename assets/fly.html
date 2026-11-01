@@ -88,12 +88,18 @@ async function boot() {
   shTex.generateMipmaps = false;
   shTex.needsUpdate = true;
 
-  const nmImg = await loadImage('/web/normal.png');
-  const nmTex = new THREE.Texture(nmImg);
+  const nmImg = await loadImage('/web/normal.png');  const nmTex = new THREE.Texture(nmImg);
   nmTex.minFilter = THREE.LinearMipmapLinearFilter;
   nmTex.magFilter = THREE.LinearFilter;
   nmTex.anisotropy = 8;
   nmTex.needsUpdate = true;
+
+  // AO(环境光遮蔽):双尺度曲率烘出,专门补山体褶皱与谷地的暗部
+  const aoImg = await loadImage('/web/ao.png');
+  const aoTex = new THREE.Texture(aoImg);
+  aoTex.minFilter = THREE.LinearMipmapLinearFilter;
+  aoTex.magFilter = THREE.LinearFilter;
+  aoTex.needsUpdate = true;
 
   const clImg = await loadImage('/web/cloud.png');
   const clTex = new THREE.Texture(clImg);
@@ -165,9 +171,9 @@ async function boot() {
     const c = document.createElement('canvas'); c.width = c.height = 256;
     const g = c.getContext('2d');
     const grd = g.createRadialGradient(128, 128, 0, 128, 128, 128);
-    grd.addColorStop(0.00, 'rgba(255,252,240,0.85)');
-    grd.addColorStop(0.10, 'rgba(255,246,214,0.55)');
-    grd.addColorStop(0.32, 'rgba(255,232,176,0.18)');
+    grd.addColorStop(0.00, 'rgba(255,252,240,0.52)');
+    grd.addColorStop(0.10, 'rgba(255,246,214,0.30)');
+    grd.addColorStop(0.32, 'rgba(255,232,176,0.09)');
     grd.addColorStop(1.00, 'rgba(255,220,150,0.0)');
     g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
     return new THREE.CanvasTexture(c);
@@ -179,7 +185,7 @@ async function boot() {
   });
   const sun = new THREE.Sprite(sunMat);
   sun.position.copy(sunDir).multiplyScalar(size * 6);
-  sun.scale.set(size * 0.80, size * 0.80, 1);   // 适中:有日晕但不洗白整片天空
+  sun.scale.set(size * 0.58, size * 0.58, 1);   // 收小,避免加性辉光把朝太阳方向的天空整片洗白
   sun.renderOrder = -5;
   scene.add(sun);
 
@@ -187,17 +193,21 @@ async function boot() {
   const uniforms = {
     map:       { value: tex },
     shadowMap: { value: shTex },
+    aoMap:     { value: aoTex },
     normalMap: { value: nmTex },
     cloudTex:  { value: clTex },
     sunDir:    { value: sunDir },
     sunColor:  { value: new THREE.Vector3(1.00, 0.96, 0.90) },
-    skyCol:    { value: new THREE.Vector3(0.52, 0.51, 0.54) },
-    groundCol: { value: new THREE.Vector3(0.28, 0.27, 0.265) },
-    fogCol:    { value: new THREE.Vector3(0.76, 0.80, 0.83) },
+    // 天光偏冷蓝:雪在背光面本就该泛蓝,这是雪面层次的主要来源;
+    // 注意与 fogCol 分工——雾色必须中性(影响整体),天光才允许带蓝(只染背光面)
+    skyCol:    { value: new THREE.Vector3(0.40, 0.49, 0.66) },
+    groundCol: { value: new THREE.Vector3(0.22, 0.25, 0.33) },
+    // 雾色必须近中性:原 (0.76,0.80,0.83) 的 B-R=+0.07,经 haze 混入后把中远景整片染成青蓝
+    fogCol:    { value: new THREE.Vector3(0.78, 0.79, 0.81) },
     fogNear:   { value: size * 0.42 },
     fogFar:    { value: size * 1.35 },
     gAlbedo:   { value: ALBEDO_GAIN },
-    gExposure: { value: 1.38 },
+    gExposure: { value: 1.12 },
     cloudY:    { value: CLOUD_Y },
     cloudPlane:{ value: size * 5.0 },
     cloudRepeat:{ value: 4.5 },
@@ -221,6 +231,7 @@ async function boot() {
     fragmentShader: `
       uniform sampler2D map;
       uniform sampler2D shadowMap;
+      uniform sampler2D aoMap;
       uniform sampler2D normalMap;
       uniform sampler2D cloudTex;
       uniform vec3 sunDir, sunColor, skyCol, groundCol, fogCol;
@@ -253,15 +264,19 @@ async function boot() {
         vec2 cp = vWorld.xz + sunDir.xz * tUp;
         vec2 cuv = (cp / cloudPlane + 0.5) * cloudRepeat;
         float cs = texture2D(cloudTex, cuv).a;
-        cs = clamp(cs * 1.6, 0.0, 1.0) * 0.62;   // 云影加实,让云和地形产生明暗耦合
+        cs = clamp(cs * 1.6, 0.0, 1.0) * 0.30;   // 云影取自 CLOUD_Y 的 cloud.png,与可见积云不是同一批云,压弱避免错位感
 
         vec3 direct = sunColor * diff * mix(0.17, 1.0, sh) * (1.0 - cs) * 1.35;
 
         float up = n.y * 0.5 + 0.5;
-        vec3 amb = mix(groundCol, skyCol, up) * (0.34 + 0.24 * sh);
+        // 环境光压低:唐古拉山高差小、阴影占比低,环境光过亮会让大量像素挤在中高亮度
+        // 再乘 AO:山体褶皱与谷地才是暗部的主要来源,这一步直接决定"石膏感"是否消失
+        float ao = texture2D(aoMap, vUv).r;
+        vec3 amb = mix(groundCol, skyCol, up) * (0.24 + 0.26 * sh) * mix(0.55, 1.0, ao);
 
         float steep = 1.0 - smoothstep(0.35, 0.96, n.y);
-        float alb = gAlbedo * mix(1.0, 0.86, steep);
+        // AO 同时调制反照率:褶皱/谷地本就积不住雪,反照率随遮蔽下降才读得出体量
+        float alb = gAlbedo * mix(1.0, 0.86, steep) * mix(0.74, 1.0, ao);
 
         vec3 col = base * alb * (direct + amb) * gExposure;
 
@@ -270,9 +285,16 @@ async function boot() {
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
         vec3 haze = mix(fogCol, skyCol, 0.35) * (0.52 + 0.62 * lum);
         col = mix(col, haze, f * 0.50);
+        // 距离衰减饱和度:雾的半透明叠加会把中远景的青蓝放大(实测 sat 0.070 -> 0.185、53% 像素变青),
+        // 真实远山是低饱和冷灰,所以越远越收色相
+        float dl = dot(col, vec3(0.299, 0.587, 0.114));
+        col = mix(vec3(dl), col, 1.0 - 0.45 * f);
 
-        col = col / (1.0 + 0.22 * col);
-        col = pow(clamp(col, 0.0, 1.0), vec3(0.95));
+        col = col / (1.0 + 0.26 * col);
+        col = clamp(col, 0.0, 1.0);
+        // 温和 S 曲线:拉开中高亮部,避免雪原糊成一片白石膏
+        col = mix(col, col * col * (3.0 - 2.0 * col), 0.38);
+        col = pow(col, vec3(0.98));
         gl_FragColor = vec4(col, 1.0);
       }`,
   });
@@ -281,13 +303,13 @@ async function boot() {
   scene.add(mesh);
 
   // ---------- 低位云海(贴山基的水平云面) ----------
-  function cloudSea(y, opacity) {
+  function cloudSea(y, opacity, rep, seed) {
     const cg = new THREE.PlaneGeometry(size * 10, size * 10, 1, 1);
     cg.rotateX(-Math.PI / 2);
     const u = {
       cloudTex: { value: clTex },
-      uRep:     { value: 2.0 },
-      uOffset:  { value: new THREE.Vector2(0, 0) },
+      uRep:     { value: rep === undefined ? 2.0 : rep },
+      uOffset:  { value: new THREE.Vector2(seed === undefined ? 0 : seed, (seed === undefined ? 0 : seed) * 0.7) },
       uOpacity: { value: opacity },
       uFar:     { value: size * 3.2 },
       uEdge:    { value: size * 4.0 },
@@ -313,7 +335,10 @@ async function boot() {
           a = clamp(a * 0.62 + b * 0.28 + c2 * 0.30, 0.0, 1.0);
           a = clamp(a * 1.45 - 0.28, 0.0, 1.0) * uOpacity;   // 更密实的云海
           // 厚处暖白,薄处偏冷蓝(云海自身的体积感)
-          vec3 c = mix(vec3(0.74, 0.79, 0.90), vec3(1.0, 0.99, 0.97), clamp(a*1.2,0.0,1.0));
+          vec3 c = mix(vec3(0.56, 0.62, 0.76), vec3(1.0, 0.99, 0.96), clamp(a*1.15,0.0,1.0));
+          // 远处云海必须提亮并融进天色,否则薄处那层暗蓝灰叠起来读成"脏雾"
+          float f2 = smoothstep(1500.0, uFar, vDist);
+          c = mix(c, vec3(0.87, 0.91, 0.96), f2 * 0.65);
           float rad = length(vW.xz) / uEdge;
           a *= 1.0 - smoothstep(0.55, 1.0, rad);              // 远处淡出,不露硬边
           float f = smoothstep(2500.0, uFar, vDist);
@@ -328,39 +353,54 @@ async function boot() {
     scene.add(cm);
     return u;
   }
-  const seaU = cloudSea(CLOUD_SEA_Y, 0.78);
+  // 云海分三层错高错频:单层平面俯瞰时就是一片平坦白斑,叠加才有厚度和顶面起伏
+  const seaRel = maxH - minH;
+  const seaU  = cloudSea(CLOUD_SEA_Y,                   0.64, 2.0, 0.00);
+  const seaU2 = cloudSea(CLOUD_SEA_Y + seaRel * 0.150,  0.44, 2.7, 0.37);
+  const seaU3 = cloudSea(CLOUD_SEA_Y + seaRel * 0.340,  0.30, 3.4, 0.71);
+  const seaLayers = [seaU, seaU2, seaU3];
 
-  // ---------- 成簇积云(峰顶周围扎堆,有体积光照) ----------
+  // ---------- 积云场(高度分层 + 幂律尺度 + 垂直发展,避免排成一条线) ----------
   function buildCumulus() {
     const list = [];
     let s = 1234567;
     const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
-    // 云场要落在相机环绕轨道之外,否则相机怼在巨型白云前面,整片天空被糊白
-    const clusters = 9;
+    const relH = maxH - minH;
+    const clusters = 12;
+    const push = (bx, bz, h, sc, op, aspect) => {
+      const m = new THREE.SpriteMaterial({
+        map: cuTex, transparent: true, depthWrite: false,
+        opacity: op, fog: false,
+      });
+      const sp = new THREE.Sprite(m);
+      sp.position.set(bx, h, bz);
+      sp.scale.set(sc, sc * aspect, 1);
+      sp.renderOrder = 3;
+      scene.add(sp);
+      list.push({ sp, bx, bz, ph: rnd() * 100, drift: 0.4 + rnd() * 1.0, op });
+    };
     for (let c = 0; c < clusters; c++) {
       const ca = rnd() * Math.PI * 2;
-      const cr = (0.35 + rnd() * 0.75) * size;               // 半径拉开,避免投影成一条线
+      const cr = (0.75 + rnd() * 0.85) * size;              // 全部推到相机轨道(0.29~0.53×size)之外,近处大云最显"贴纸"
       const cx0 = summit.x + Math.cos(ca) * cr;
       const cz0 = summit.z + Math.sin(ca) * cr;
-      const nIn = 3 + Math.floor(rnd() * 3);
+      const nIn = 2 + Math.floor(rnd() * 4);
       for (let k = 0; k < nIn; k++) {
-        const ang = rnd() * Math.PI * 2, rr = rnd() * size * 0.16;
+        const ang = rnd() * Math.PI * 2, rr = rnd() * size * 0.14;
         const bx = cx0 + Math.cos(ang) * rr;
         const bz = cz0 + Math.sin(ang) * rr;
-        let h = CLOUD_Y + (rnd() * 2 - 1) * 1200;            // 高度也拉开
-        if (rnd() < 0.35) h += rnd() * 2200;                 // 垂直发展:抬到相机高度以上,出现在高空
-        const sc = size * (0.05 + rnd() * 0.14);              // 1.2~4.6km 真实积云尺度
-        const op = 0.90 + rnd() * 0.10;
-        const m = new THREE.SpriteMaterial({
-          map: cuTex, transparent: true, depthWrite: false,
-          opacity: op, fog: false,
-        });
-        const sp = new THREE.Sprite(m);
-        sp.position.set(bx, h, bz);
-        sp.scale.set(sc, sc * 0.66, 1);
-        sp.renderOrder = 3;
-        scene.add(sp);
-        list.push({ sp, bx, bz, ph: rnd() * 100, drift: 0.4 + rnd() * 1.0, op });
+        // 高度:幂偏分布——低云多、高云少,而不是全挤在 CLOUD_Y 一条带上
+        const hb = Math.pow(rnd(), 1.8);
+        const h = CLOUD_Y * 0.50 + hb * relH * 1.60 + (rnd() * 2 - 1) * 260;
+        // 尺度:幂律——大量小云 + 少数大云,方差拉大才能读出不规则
+        const sc = size * (0.030 + Math.pow(rnd(), 2.1) * 0.20);
+        const op = 0.55 + rnd() * 0.45;
+        push(bx, bz, h, sc, op, 0.62);
+        // 垂直发展:40% 的云加一个顶部隆起,形成塔状而非单个扁球
+        if (rnd() < 0.40) {
+          push(bx + (rnd() * 2 - 1) * sc * 0.18, bz + (rnd() * 2 - 1) * sc * 0.18,
+               h + sc * 0.30, sc * 0.58, op * 0.92, 0.70);
+        }
       }
     }
     return list;
@@ -408,8 +448,12 @@ async function boot() {
     cam.lookAt(target);
     cam.rotateZ(Math.sin(t * Math.PI * 1.1) * 0.016);
 
-    // 云海缓慢漂移
-    seaU.uOffset.value.set(t * 0.012, t * 0.004);
+    // 云海三层不同速度漂移:相对位移让叠加层读成体积而不是同一张图
+    for (let i = 0; i < seaLayers.length; i++) {
+      const sp = 0.9 + i * 0.55;
+      seaLayers[i].uOffset.value.x += 0.0011 * sp;
+      seaLayers[i].uOffset.value.y += 0.0004 * sp;
+    }
 
     // 积云空气透视:远处的云降对比并融入天色,否则远近一样清晰会读成"贴上去的贴纸"
     for (const p of cumList) {

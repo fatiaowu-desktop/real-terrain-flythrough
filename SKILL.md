@@ -39,7 +39,7 @@ export CHROME=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 ```
 <project>/vendor/three.module.js     # fetch_three.py 产出
 <project>/web/fly.html               # assets/fly.html 拷贝
-<project>/web/{heights,normal,shadow}.png, satellite.jpg, {cloud,cumulus,sky}.png, world.json
+<project>/web/{heights,normal,shadow,ao}.png, satellite.jpg, {cloud,cumulus,sky}.png, world.json
 ```
 
 ### Step 1 — 搭骨架
@@ -133,7 +133,7 @@ FRAMES=240 PORT=8765 node $SKILL/scripts/render.js        # 约 1 分钟
 | `build_world.py` | **主编排**:经纬度 → web/ 全套资源 + world.json |
 | `dem.py` | Terrarium DEM 抓取(bbox/zoom/瓦片/解码/补洞),也可 CLI 单独跑 |
 | `imagery.py` | ESRI 卫星影像,裁剪逻辑与 DEM 严格对齐 |
-| `shade.py` | 投射阴影预烘(山体层次约 80% 来自"山挡山")+ AO |
+| `shade.py` | 投射阴影预烘(山体层次约 80% 来自"山挡山")+ AO(高差小、阴影少的地形全靠它提供体量感) |
 | `clouds.py` | 云海密度 / 积云 / 天空穹顶三张贴图 |
 | `render.js` | headless Chrome 逐帧驱动 |
 | `encode.py` | 帧序列 → mp4,以及改前/改后对比图 |

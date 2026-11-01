@@ -56,6 +56,20 @@ def _blur(arr, radius):
     return np.asarray(im).astype(np.float32) / 255.0
 
 
+def _blur_wrap(arr, radius):
+    """水平方向环绕的高斯模糊。
+
+    PIL 的 GaussianBlur **不处理环绕**,会拿图像外当作无关像素,
+    于是贴图左右边缘对不上 —— 贴到天空球上就是一道竖直硬缝
+    (实测左右边缘平均差 0.072、最大 0.41)。这里横向平铺三份再裁中间,
+    保证 u 方向首尾连续。垂直方向不需要(极点不收拢)。
+    """
+    h, w = arr.shape
+    t = np.tile(arr, (1, 3))
+    b = _blur(t, radius)
+    return b[:, w:2 * w]
+
+
 def build(n=2048, outdir="web"):
     """无缝云密度贴图(周期 fbm),供云海面与山体云影共用"""
     base = fbm_seamless(n, base=6, octaves=7, persistence=0.62, seed=11)
@@ -138,7 +152,7 @@ def build_sky(w=2048, h=1024, outdir="web"):
     yy = np.linspace(0, 1, h)[:, None]              # 0 顶, 1 底
     deep = np.array([0.18, 0.38, 0.72])             # 天顶深蓝
     mid = np.array([0.40, 0.60, 0.85])              # 近地平线适度加深,别糊成灰白
-    hor = np.array([0.75, 0.80, 0.86])              # 地平线苍白带
+    hor = np.array([0.62, 0.70, 0.81])              # 地平线带:别太苍白,相机压低时整片天空都是这一带
     t1 = np.clip(yy / 0.55, 0, 1)[:, :, None]
     t2 = np.clip((yy - 0.55) / 0.45, 0, 1)[:, :, None]
     lo = deep[None, None, :] * (1 - t1) + mid[None, None, :] * t1
@@ -154,15 +168,20 @@ def build_sky(w=2048, h=1024, outdir="web"):
     xw = (np.arange(cn)[None, :] + wx).astype(int) % cn
     cfb = fbm_seamless(cn, base=11, octaves=6, persistence=0.58, seed=13)[yw, xw]
     cfb = (cfb - cfb.min()) / (cfb.max() - cfb.min())
+    cfb = _blur_wrap(cfb, 16)                        # 环绕模糊,否则天空球上出现竖直接缝
     cimg = Image.fromarray((cfb * 255).astype(np.uint8))
-    cimg = cimg.filter(ImageFilter.GaussianBlur(16))
     cimg = cimg.resize((w, h), Image.LANCZOS)
     cf = np.asarray(cimg).astype(np.float32) / 255.0
-    cov = np.clip((cf - 0.46) / 0.26, 0, 1)
+    cov = np.clip((cf - 0.435) / 0.30, 0, 1)
     cov = cov * cov * (3 - 2 * cov)
-    cov = _blur(cov, 10)
+    cov = _blur_wrap(cov, 10)
     # 刻意不做 band 限制:等距贴图上「可见天空」只占很窄一条,任何 band 都可能误伤它
     cov = np.clip(cov * 1.15, 0, 1)
+    # 但实测会翻车:可见带 v∈[0.40,0.60] 覆盖率只有 10~12%,而 v>0.9(天底,永远看不到)
+    # 高达 98% —— 云全堆在看不见的地方,于是相机转到某个方位时天空一片空白。
+    # 用高斯权重平滑抬高可见带,不做硬 band(硬裁会留下直边)。
+    vis = np.exp(-((yy - 0.42) / 0.16) ** 2)
+    cov = np.clip(cov + 0.20 * vis, 0, 1)
     cloud = np.stack([np.full((h, w), 0.95), np.full((h, w), 0.96), np.full((h, w), 0.98)], -1)
     col = col * (1 - cov)[..., None] + cloud * cov[..., None]
 

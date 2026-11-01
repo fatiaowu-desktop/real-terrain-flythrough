@@ -33,8 +33,20 @@ def stats(a, y0, y1):
     sat = max(R, G, B) - min(R, G, B)
     lumM = 0.299 * r[..., 0] + 0.587 * r[..., 1] + 0.114 * r[..., 2]
     satM = r.max(2) - r.min(2)
-    cloud = float(((lumM > 0.70) & (satM < 0.18)).mean() * 100)
-    return dict(R=R, G=G, B=B, lum=lum, sat=sat, cloud=cloud)
+    is_cloud = (lumM > 0.70) & (satM < 0.18)
+    cloud = float(is_cloud.mean() * 100)
+
+    # 判据必须排除云像素。云一多,整片平均值必然变亮变灰 —— 那是云量,不是缺陷。
+    # 早期不排除云像素时,多云天空会被误报成"发灰+过曝",导致往错误方向调参。
+    clear = ~is_cloud
+    if clear.sum() > 200:
+        Rc, Gc, Bc = r[clear][:, 0].mean(), r[clear][:, 1].mean(), r[clear][:, 2].mean()
+    else:
+        Rc, Gc, Bc = R, G, B
+    lum_c = 0.299 * Rc + 0.587 * Gc + 0.114 * Bc
+    sat_c = max(Rc, Gc, Bc) - min(Rc, Gc, Bc)
+    return dict(R=R, G=G, B=B, lum=lum, sat=sat, cloud=cloud,
+                Rc=Rc, Gc=Gc, Bc=Bc, lum_clear=lum_c, sat_clear=sat_c)
 
 
 def grid(a, gy=8, gx=4):
@@ -55,21 +67,21 @@ def report(path, want_grid=False, brief=False):
     terr = stats(a, 0.65, 1.00)
 
     warn = []
-    if sky["sat"] < 0.25:
-        warn.append(f"天空发灰(饱和度 {sky['sat']:.3f} < 0.25) —— 检查是否有巨型云挡镜头")
-    if sky["lum"] > 0.75:
-        warn.append(f"天空过曝(亮度 {sky['lum']:.3f} > 0.75) —— 检查加性辉光是否过大")
+    if sky["sat_clear"] < 0.25:
+        warn.append(f"天空底色发灰(排除云后饱和度 {sky['sat_clear']:.3f} < 0.25) —— 检查是否有巨型云挡镜头")
+    if sky["lum_clear"] > 0.75:
+        warn.append(f"天空底色过曝(排除云后亮度 {sky['lum_clear']:.3f} > 0.75) —— 检查加性辉光是否过大")
     if sky["cloud"] < 3:
         warn.append(f"天空几乎无云({sky['cloud']:.1f}%) —— 检查 sky.png 覆盖率或 band 限制")
 
     if brief:
         flag = "OK " if not warn else "WARN"
-        print(f"[{flag}] {path:28s} sky sat{sky['sat']:.3f} lum{sky['lum']:.3f} "
+        print(f"[{flag}] {path:28s} sky sat{sky['sat_clear']:.3f} lum{sky['lum_clear']:.3f} "
               f"cloud{sky['cloud']:5.1f}%  | terr R{terr['R']:.3f} G{terr['G']:.3f} B{terr['B']:.3f}")
     else:
         print(f"\n=== {path} ===")
-        print(f"天空(上35%)  R{sky['R']:.3f} G{sky['G']:.3f} B{sky['B']:.3f}  "
-              f"lum{sky['lum']:.3f}  sat{sky['sat']:.3f}  云像素{sky['cloud']:.1f}%")
+        print(f"天空底色(上35%,排除云)  R{sky['Rc']:.3f} G{sky['Gc']:.3f} B{sky['Bc']:.3f}  "
+              f"lum{sky['lum_clear']:.3f}  sat{sky['sat_clear']:.3f}  云像素{sky['cloud']:.1f}%")
         print(f"地形(下35%)  R{terr['R']:.3f} G{terr['G']:.3f} B{terr['B']:.3f}  "
               f"lum{terr['lum']:.3f}  sat{terr['sat']:.3f}")
         if want_grid:
