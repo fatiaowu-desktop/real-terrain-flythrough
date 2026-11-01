@@ -210,7 +210,7 @@ async function boot() {
     normalMap: { value: nmTex },
     cloudTex:  { value: clTex },
     sunDir:    { value: sunDir },
-    sunColor:  { value: new THREE.Vector3(1.00, 0.96, 0.90) },
+    sunColor:  { value: new THREE.Vector3(1.00, 0.88, 0.72) },   // 低角度太阳偏暖,与蓝天环境形成冷暖对比
     // 天光偏冷蓝:雪在背光面本就该泛蓝,这是雪面层次的主要来源;
     // 注意与 fogCol 分工——雾色必须中性(影响整体),天光才允许带蓝(只染背光面)
     skyCol:    { value: new THREE.Vector3(0.40, 0.49, 0.66) },
@@ -233,10 +233,12 @@ async function boot() {
       varying vec3 vN;
       varying vec3 vWorld;
       varying float vDist;
+      varying vec3 vViewDir;
       void main(){
         vUv = uv;
         vN  = normalize(normal);
         vWorld = position;
+        vViewDir = normalize(cameraPosition - position);
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
         vDist = -mv.z;
         gl_Position = projectionMatrix * mv;
@@ -255,6 +257,7 @@ async function boot() {
       varying vec3 vN;
       varying vec3 vWorld;
       varying float vDist;
+      varying vec3 vViewDir;
 
       void main(){
         vec3 base = texture2D(map, vUv).rgb;
@@ -265,6 +268,13 @@ async function boot() {
         float bright = smoothstep(0.38, 0.70, luma);
         vec3 nbase = vec3(base.r, min(base.g, max(base.r, base.b)), base.b);
         base = mix(base, nbase, bright);
+        // 坡度控雪:S2 影像是 10m 分辨率,裸岩被放大后糊成"灰褐色污迹"贴在雪坡上。
+        // 物理上缓坡积得住雪、裸岩只出现在陡坡 —— 用坡度把缓坡上偏黄的部分擦回冷白。
+        float flatness = smoothstep(0.32, 0.72, vN.y);           // 1 = 平缓(用几何法线,即真实坡向)
+        float brownish = clamp((base.r - base.b) * 3.5, 0.0, 1.0);  // 偏黄程度
+        float l0 = dot(base, vec3(0.299, 0.587, 0.114));
+        vec3 cleanSnow = vec3(l0 * 0.955, l0 * 0.985, l0 * 1.055);
+        base = mix(base, cleanSnow, flatness * brownish * 0.88);
         // 雪/岩分离:雪是高反照率材质,不能跟岩石一起被压暗 —— 一起压就成"水泥"
         float snowM = smoothstep(0.62, 0.88, luma);
         base = mix(base, base * vec3(0.93, 0.97, 1.07), snowM);   // 雪偏冷蓝
@@ -303,6 +313,11 @@ async function boot() {
         alb *= 1.0 + (det - 0.5) * 0.55 * snowM;
 
         vec3 col = base * alb * (direct + amb) * gExposure;
+        // 雪的镜面高光:低角度阳光下的雪是强反光材质(钻石尘/雪面反光),
+        // 缺了这层,雪就只是"漫反射的白",读作石膏。这是拉近"真雪"最廉价的一笔。
+        vec3 hv = normalize(sunDir + normalize(vViewDir));
+        float spec = pow(max(dot(n, hv), 0.0), 42.0) * sh * (1.0 - cs);
+        col += sunColor * spec * 0.85 * mix(0.20, 1.0, snowM);
 
         // 保色大气透视:远山透得出纹理而非糊成灰片
         float f = smoothstep(fogNear, fogFar, vDist);
@@ -311,6 +326,10 @@ async function boot() {
         float edgeD = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
         float ef = 1.0 - smoothstep(0.015, 0.12, edgeD);
         f = max(f, ef);
+        // 高度雾:真实大气密度随高度指数衰减 —— 山谷雾浓、峰顶清透。
+        // 之前雾只按距离算,所以远近山的"空气量"是一样的,缺了山地最明显的层次感。
+        float altFac = exp(-max(vWorld.y, 0.0) / 850.0);
+        f = clamp(f * mix(0.48, 1.35, altFac), 0.0, 1.0);
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
         vec3 haze = mix(fogCol, skyCol, 0.35) * (0.52 + 0.62 * lum);
         col = mix(col, haze, max(f * 0.50, ef * 0.94));
