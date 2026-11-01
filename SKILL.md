@@ -39,7 +39,7 @@ export CHROME=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 ```
 <project>/vendor/three.module.js     # fetch_three.py 产出
 <project>/web/fly.html               # assets/fly.html 拷贝
-<project>/web/{heights,normal,shadow,ao}.png, satellite.jpg, {cloud,cumulus,sky}.png, world.json
+<project>/web/{heights,normal,shadow,ao,detail}.png, satellite.jpg, {cloud,cumulus,sky}.png, world.json
 ```
 
 ### Step 1 — 搭骨架

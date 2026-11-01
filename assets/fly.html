@@ -101,6 +101,15 @@ async function boot() {
   aoTex.magFilter = THREE.LinearFilter;
   aoTex.needsUpdate = true;
 
+  // 雪面程序化细节:卫星影像雪区几乎无纹理,提亮时需要这层高频撑住层次
+  const dtImg = await loadImage('/web/detail.png');
+  const dtTex = new THREE.Texture(dtImg);
+  dtTex.wrapS = dtTex.wrapT = THREE.RepeatWrapping;
+  dtTex.minFilter = THREE.LinearMipmapLinearFilter;
+  dtTex.magFilter = THREE.LinearFilter;
+  dtTex.anisotropy = 4;
+  dtTex.needsUpdate = true;
+
   const clImg = await loadImage('/web/cloud.png');
   const clTex = new THREE.Texture(clImg);
   clTex.wrapS = clTex.wrapT = THREE.RepeatWrapping;
@@ -171,9 +180,9 @@ async function boot() {
     const c = document.createElement('canvas'); c.width = c.height = 256;
     const g = c.getContext('2d');
     const grd = g.createRadialGradient(128, 128, 0, 128, 128, 128);
-    grd.addColorStop(0.00, 'rgba(255,252,240,0.52)');
-    grd.addColorStop(0.10, 'rgba(255,246,214,0.30)');
-    grd.addColorStop(0.32, 'rgba(255,232,176,0.09)');
+    grd.addColorStop(0.00, 'rgba(255,252,240,0.40)');
+    grd.addColorStop(0.10, 'rgba(255,246,214,0.23)');
+    grd.addColorStop(0.32, 'rgba(255,232,176,0.07)');
     grd.addColorStop(1.00, 'rgba(255,220,150,0.0)');
     g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
     return new THREE.CanvasTexture(c);
@@ -185,7 +194,7 @@ async function boot() {
   });
   const sun = new THREE.Sprite(sunMat);
   sun.position.copy(sunDir).multiplyScalar(size * 6);
-  sun.scale.set(size * 0.58, size * 0.58, 1);   // 收小,避免加性辉光把朝太阳方向的天空整片洗白
+  sun.scale.set(size * 0.46, size * 0.46, 1);   // 收小,避免加性辉光把朝太阳方向的天空整片洗白
   sun.renderOrder = -5;
   scene.add(sun);
 
@@ -194,6 +203,7 @@ async function boot() {
     map:       { value: tex },
     shadowMap: { value: shTex },
     aoMap:     { value: aoTex },
+    detailMap: { value: dtTex },
     normalMap: { value: nmTex },
     cloudTex:  { value: clTex },
     sunDir:    { value: sunDir },
@@ -232,6 +242,7 @@ async function boot() {
       uniform sampler2D map;
       uniform sampler2D shadowMap;
       uniform sampler2D aoMap;
+      uniform sampler2D detailMap;
       uniform sampler2D normalMap;
       uniform sampler2D cloudTex;
       uniform vec3 sunDir, sunColor, skyCol, groundCol, fogCol;
@@ -251,6 +262,9 @@ async function boot() {
         float bright = smoothstep(0.38, 0.70, luma);
         vec3 nbase = vec3(base.r, min(base.g, max(base.r, base.b)), base.b);
         base = mix(base, nbase, bright);
+        // 雪/岩分离:雪是高反照率材质,不能跟岩石一起被压暗 —— 一起压就成"水泥"
+        float snowM = smoothstep(0.62, 0.88, luma);
+        base = mix(base, base * vec3(0.93, 0.97, 1.07), snowM);   // 雪偏冷蓝
 
         vec3 nm = texture2D(normalMap, vUv).rgb * 2.0 - 1.0;
         vec3 n = normalize(mix(normalize(vN), normalize(nm), 0.34));
@@ -277,14 +291,24 @@ async function boot() {
         float steep = 1.0 - smoothstep(0.35, 0.96, n.y);
         // AO 同时调制反照率:褶皱/谷地本就积不住雪,反照率随遮蔽下降才读得出体量
         float alb = gAlbedo * mix(1.0, 0.86, steep) * mix(0.74, 1.0, ao);
+        alb *= mix(1.0, 1.34, snowM);                      // 雪不做同等压暗
+        // 雪面细节:影像在雪区没有纹理,靠程序化高频撑住提亮后的层次。
+        // 重复次数要小 —— 平铺 3 次时每 4km 重复一次,会看出"蜂窝贴纸"。
+        float det = texture2D(detailMap, vUv * 1.15).r;
+        alb *= 1.0 + (det - 0.5) * 0.55 * snowM;
 
         vec3 col = base * alb * (direct + amb) * gExposure;
 
         // 保色大气透视:远山透得出纹理而非糊成灰片
         float f = smoothstep(fogNear, fogFar, vDist);
+        // 地形 plane 的方形边界必须在雾里彻底消失:只在末端改颜色会留下一条直线
+        // (实测 y≈0.56 横跨 70% 画面、梯度 0.034)。这里把边缘的雾量直接推到接近 1。
+        float edgeD = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
+        float ef = 1.0 - smoothstep(0.015, 0.12, edgeD);
+        f = max(f, ef);
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
         vec3 haze = mix(fogCol, skyCol, 0.35) * (0.52 + 0.62 * lum);
-        col = mix(col, haze, f * 0.50);
+        col = mix(col, haze, max(f * 0.50, ef * 0.94));
         // 距离衰减饱和度:雾的半透明叠加会把中远景的青蓝放大(实测 sat 0.070 -> 0.185、53% 像素变青),
         // 真实远山是低饱和冷灰,所以越远越收色相
         float dl = dot(col, vec3(0.299, 0.587, 0.114));
@@ -353,12 +377,10 @@ async function boot() {
     scene.add(cm);
     return u;
   }
-  // 云海分三层错高错频:单层平面俯瞰时就是一片平坦白斑,叠加才有厚度和顶面起伏
-  const seaRel = maxH - minH;
-  const seaU  = cloudSea(CLOUD_SEA_Y,                   0.64, 2.0, 0.00);
-  const seaU2 = cloudSea(CLOUD_SEA_Y + seaRel * 0.150,  0.44, 2.7, 0.37);
-  const seaU3 = cloudSea(CLOUD_SEA_Y + seaRel * 0.340,  0.30, 3.4, 0.71);
-  const seaLayers = [seaU, seaU2, seaU3];
+  // 云海平面**已移除**。水平面 + 俯视相机 = 一层半透明白膜盖在山体上,边界是 plane 的直线折角
+  // (实测画面 y≈0.56 处有横跨 70% 宽度、梯度 0.034 的水平硬边),观感就是"山体糊了塑料膜"、
+  // 云在山体间穿模。云海改用 sprite 只能缓解、不能根治 —— 平面方案的几何前提就是错的。
+  const seaLayers = [];
 
   // ---------- 积云场(高度分层 + 幂律尺度 + 垂直发展,避免排成一条线) ----------
   function buildCumulus() {
@@ -366,7 +388,7 @@ async function boot() {
     let s = 1234567;
     const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
     const relH = maxH - minH;
-    const clusters = 12;
+    const clusters = 6;                                    // 少量云:一堆小云读作"纸巾屑",几朵大云才像天空
     const push = (bx, bz, h, sc, op, aspect) => {
       const m = new THREE.SpriteMaterial({
         map: cuTex, transparent: true, depthWrite: false,
@@ -384,7 +406,7 @@ async function boot() {
       const cr = (0.75 + rnd() * 0.85) * size;              // 全部推到相机轨道(0.29~0.53×size)之外,近处大云最显"贴纸"
       const cx0 = summit.x + Math.cos(ca) * cr;
       const cz0 = summit.z + Math.sin(ca) * cr;
-      const nIn = 2 + Math.floor(rnd() * 4);
+      const nIn = 2 + Math.floor(rnd() * 2);
       for (let k = 0; k < nIn; k++) {
         const ang = rnd() * Math.PI * 2, rr = rnd() * size * 0.14;
         const bx = cx0 + Math.cos(ang) * rr;
@@ -393,7 +415,7 @@ async function boot() {
         const hb = Math.pow(rnd(), 1.8);
         const h = CLOUD_Y * 0.50 + hb * relH * 1.60 + (rnd() * 2 - 1) * 260;
         // 尺度:幂律——大量小云 + 少数大云,方差拉大才能读出不规则
-        const sc = size * (0.030 + Math.pow(rnd(), 2.1) * 0.20);
+        const sc = size * (0.045 + Math.pow(rnd(), 1.8) * 0.26);   // 方差拉大:大云撑场面,小云点缀
         const op = 0.55 + rnd() * 0.45;
         push(bx, bz, h, sc, op, 0.62);
         // 垂直发展:40% 的云加一个顶部隆起,形成塔状而非单个扁球

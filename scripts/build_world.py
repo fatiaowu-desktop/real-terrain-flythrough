@@ -104,6 +104,7 @@ def build(name="未命名", sub="", latin="", lat=0.0, lon=0.0, km=20.0,
         CL.build(outdir=outdir)
         CL.build_cumulus(outdir=outdir)
         CL.build_sky(outdir=outdir)
+        CL.build_detail(outdir=outdir)
 
     print(f"[ok] {outdir}/  高程 {lo:.0f}-{hi:.0f}m  网格 {grid}x{grid}  "
           f"纹理 {im.width}x{im.height}")

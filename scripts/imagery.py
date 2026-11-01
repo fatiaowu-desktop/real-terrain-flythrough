@@ -42,6 +42,36 @@ def _fetch(z, x, y, cache=DEFAULT_CACHE, tries=4):
     raise RuntimeError(f"imagery {z}/{x}/{y} after {tries} tries: {last}")
 
 
+def _balance_tiles(mos, rows, cols, ts=256, strength=0.8):
+    """逐瓦片色调均衡。
+
+    ESRI 相邻瓦片常来自**不同时间/不同卫星**,画面在同一区域叠出来是调子不同的方块,
+    硬拼(直接赋值)会留下肉眼可见的方形色块 —— 渲染出来就是"山体上有不自然的方块"。
+    以瓦片均值的中位数为目标做增益校正,并夹住增益范围避免把雪压成灰、把岩提成白。
+    """
+    m = mos.astype(np.float32)
+    means = np.array([[mos[j * ts:(j + 1) * ts, i * ts:(i + 1) * ts].mean()
+                       for i in range(cols)] for j in range(rows)])
+    valid = means[means > 1.0]
+    if valid.size == 0:
+        return mos
+    target = float(np.median(valid))
+    changed = 0
+    for j in range(rows):
+        for i in range(cols):
+            mu = means[j, i]
+            if mu < 1.0:
+                continue
+            gain = 1.0 + (target / mu - 1.0) * strength
+            gain = float(np.clip(gain, 0.82, 1.22))
+            if abs(gain - 1.0) < 0.004:
+                continue
+            changed += 1
+            m[j * ts:(j + 1) * ts, i * ts:(i + 1) * ts] *= gain
+    print(f"[imagery] 色调均衡 {changed}/{rows * cols} 块  目标均值 {target:.1f}")
+    return np.clip(m, 0, 255).astype(np.uint8)
+
+
 def build_imagery(bbox, z, cache=DEFAULT_CACHE, workers=8, lonlat_to_px=None):
     """裁剪逻辑与 dem.build_elevation 完全一致。lonlat_to_px 由调用方注入以避免循环导入"""
     if lonlat_to_px is None:
@@ -64,6 +94,8 @@ def build_imagery(bbox, z, cache=DEFAULT_CACHE, workers=8, lonlat_to_px=None):
             im = np.asarray(Image.fromarray(im).resize((256, 256), Image.LANCZOS))
         oy, ox = (ty - ty0) * 256, (tx - tx0) * 256
         mos[oy:oy + 256, ox:ox + 256] = im
+
+    mos = _balance_tiles(mos, rows, cols)
 
     cx, cy = x0f - tx0 * 256, y0f - ty0 * 256
     cw, ch = x1f - x0f, y1f - y0f

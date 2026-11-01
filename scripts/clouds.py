@@ -106,44 +106,76 @@ def build(n=2048, outdir="web"):
 
 
 def build_cumulus(n=1024, outdir="web"):
-    """朝向相机的体积感积云:多瓣 cauliflower 轮廓 + 强对比暖白顶 / 深冷蓝底"""
-    warp_x = (fbm_seamless(n, base=8, octaves=3, persistence=0.6, seed=77) - 0.5) * n * 0.10
-    warp_y = (fbm_seamless(n, base=8, octaves=3, persistence=0.6, seed=91) - 0.5) * n * 0.10
-    yyw = (np.arange(n)[:, None] + warp_y).astype(int) % n
-    xxw = (np.arange(n)[None, :] + warp_x).astype(int) % n
+    """积云精灵:多个高斯"泡泡"叠加成花椰菜轮廓 + 云底压平 + 宽羽化 + 厚度受光。
 
-    base = fbm_seamless(n, base=9, octaves=6, persistence=0.55, seed=5)[yyw, xxw]
-    detail = fbm_seamless(n, base=24, octaves=5, persistence=0.5, seed=8)[yyw, xxw]
-
+    旧版是「径向衰减 × fbm + 6px 模糊」,结果是**近似正圆的扁平团块、边缘硬锯齿**,
+    贴到天上就是一眼假的贴纸。积云的辨识特征是"多个圆顶堆在一条平云底上",
+    所以这里改成泡泡场,而不是单个径向形状。
+    """
+    rng = np.random.default_rng(7)
     yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
-    cy = cx = n / 2
-    d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (n / 2)
-    radial = np.clip(1.0 - d, 0, 1)
+    vpos = yy / n                                    # 0 顶, 1 底 (PIL 行序)
 
-    vpos = yy / n                                   # 0 顶, 1 底 (PIL 行序)
-    vbias = 1.0 - vpos
-    lump = base * 0.46 + detail * 0.36              # 低频定大形 + 高频切小叶
-    shape = radial * 0.52 + lump * 0.88 - 0.02
-    shape *= (0.80 + 0.40 * vbias)
-    a = np.clip((shape - 0.28) / 0.46, 0, 1)
-    a = a * a * (3 - 2 * a)
-    a = _blur(a, 6)
-    a = np.clip(a * (radial ** 0.22), 0, 1)
-    a = a * a * (3 - 2 * a)
-    a = np.clip(a * 1.25 - 0.05, 0, 1)
+    # --- 泡泡场:小而多,叠出来才有花椰菜轮廓(大而少会并成一个光滑团) ---
+    field = np.zeros((n, n), np.float32)
+    for _ in range(30):
+        ang = rng.random() * 2 * np.pi
+        rr = (rng.random() ** 0.72) * n * 0.27
+        cx = n * 0.50 + np.cos(ang) * rr
+        cy = n * 0.50 + np.sin(ang) * rr * 0.68 - n * 0.05   # 整体偏上
+        rad = n * (0.065 + rng.random() * 0.075)
+        # 用 max 而非 sum:sum 会把相邻泡泡平滑成一个光滑外壳,
+        # max 保留每个圆顶自己的边界,并集才读得出花椰菜
+        field = np.maximum(field, np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (rad * rad))))
+    # --- 云底压平:真实积云底部是一条相对平坦的云底 ---
+    field *= np.clip((0.70 - vpos) / 0.14, 0, 1)
+    field /= max(float(field.max()), 1e-6)
 
-    # 强对比体积光照:顶部暖白受光,底部深冷蓝背阴
-    litC = np.array([1.00, 0.98, 0.92])
-    shadC = np.array([0.30, 0.38, 0.60])
-    sh = np.clip(vbias * 1.10 - 0.08, 0, 1)[:, :, None]
-    rgb = shadC[None, None, :] + (litC - shadC)[None, None, :] * sh
-    rgb = rgb * (0.90 + 0.10 * a[:, :, None])
+    # --- alpha:轻羽化,保住泡泡的波浪轮廓(blur 过大就退回成光滑土豆) ---
+    a = np.clip((field - 0.19) / 0.26, 0, 1)
+    a = a * a * (3 - 2 * a)
+    a = _blur(a, 9)
+    a = np.clip(a * 1.22, 0, 1)
+
+    # --- 受光:厚度(圆顶)占 40%,垂直位置占 60%,把对比拉开 ---
+    thick = np.clip(field / 0.70, 0, 1)
+    vert = np.power(1.0 - vpos, 0.62)
+    lit = np.clip(0.40 * thick + 0.60 * vert, 0, 1)
+    tex = fbm_seamless(n, base=26, octaves=4, persistence=0.5, seed=8)
+    lit = np.clip(lit * (0.82 + 0.36 * tex), 0, 1)   # 内部翻滚,别太光滑
+
+    litC = np.array([1.00, 0.99, 0.96])
+    shadC = np.array([0.40, 0.48, 0.66])
+    rgb = shadC[None, None, :] + (litC - shadC)[None, None, :] * lit[:, :, None]
 
     rgba = np.concatenate([rgb, a[..., None]], -1)
     img = Image.fromarray((np.clip(rgba, 0, 1) * 255).astype(np.uint8), "RGBA")
     p = os.path.join(outdir, "cumulus.png")
     img.save(p)
-    print(f"[cumulus] {p}  均值 {a.mean():.2f}  峰值 {a.max():.2f}")
+    edge = float(a[:2].mean() + a[-2:].mean() + a[:, :2].mean() + a[:, -2:].mean())
+    print(f"[cumulus] {p}  均值 {a.mean():.2f}  峰值 {a.max():.2f}  边缘alpha {edge / 4:.4f}(应≈0)")
+    return p
+
+
+def build_detail(n=2048, outdir="web"):
+    """雪面程序化细节贴图。
+
+    卫星影像在雪区几乎没有纹理(实测 5x5 局部 std 只有 0.039,是岩石区的 1/3),
+    所以直接提亮雪会变成一片死白 —— 这正是"水泥感"的来源。这里补一层多尺度高频
+    (中性 0.5±0.09),在着色器里只作用于雪区,提亮时才有层次可看。
+
+    频率必须够高且三档权重接近:低频那档权重过大时,雪面会被拉出方向性条纹,
+    读成"水波/绸缎"而不是雪。
+    """
+    a = fbm_seamless(n, base=15, octaves=4, persistence=0.55, seed=101)
+    b = fbm_seamless(n, base=44, octaves=4, persistence=0.50, seed=202)
+    c = fbm_seamless(n, base=120, octaves=3, persistence=0.46, seed=303)
+    d = a * 0.34 + b * 0.36 + c * 0.30
+    d = (d - d.mean()) / max(float(d.std()), 1e-6) * 0.09 + 0.5
+    d = np.clip(d, 0, 1)
+    p = os.path.join(outdir, "detail.png")
+    Image.fromarray((d * 255).astype(np.uint8)).save(p)
+    print(f"[detail] {p}  中性 0.50±0.09")
     return p
 
 
@@ -200,6 +232,7 @@ def main():
     build(outdir=a.outdir)
     build_cumulus(outdir=a.outdir)
     build_sky(outdir=a.outdir)
+    build_detail(outdir=a.outdir)
 
 
 if __name__ == "__main__":
